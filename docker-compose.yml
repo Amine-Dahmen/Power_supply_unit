@@ -1,0 +1,87 @@
+version: "3.8"
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: borne-mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+    healthcheck:
+      test: ["CMD", "mosquitto_pub", "-h", "localhost", "-p", "1883", "-t", "healthcheck", "-n"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - borne-net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: borne-postgres
+    environment:
+      POSTGRES_USER: borne
+      POSTGRES_PASSWORD: borne_dev
+      POSTGRES_DB: borne_energy
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U borne -d borne_energy"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - borne-net
+
+  backend:
+    build:
+      context: ./energy-management-backend
+      dockerfile: Dockerfile
+    container_name: borne-backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://borne:borne_dev@postgres:5432/borne_energy"
+      MQTT_BROKER_HOST: mosquitto
+      MQTT_BROKER_PORT: "1883"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - borne-net
+
+  simulator:
+    build:
+      context: ./energy-terminal-simulator
+      dockerfile: Dockerfile
+    container_name: borne-simulator
+    ports:
+      - "8001:8001"
+    environment:
+      MQTT_BROKER_HOST: mosquitto
+      MQTT_BROKER_PORT: "1883"
+      SIMULATOR_PORT: "8001"
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - borne-net
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:
+  postgres-data:
+
+networks:
+  borne-net:
+    driver: bridge
