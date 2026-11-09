@@ -77,24 +77,32 @@ docker compose up --build
 
 ## Complete End-to-End Workflow
 
-Follow this step-by-step example using `curl` or the Swagger UI:
+The following example uses **Windows PowerShell**. The backend API runs on
+port `8000`; the simulator API runs on port `8001`. Use the simulator API for
+RFID card taps and the backend API for reservations, consumption, and invoices.
 
 ### 1. Check Initial Terminal States
-```bash
-curl -X GET http://localhost:8000/terminals
+```powershell
+Invoke-RestMethod http://localhost:8000/terminals
 ```
-All terminals (`ST-01`, `ST-02`, `ST-03`) start in `ACTIVE` state.
+All terminals (`ST-01`, `ST-02`, `ST-03`) should start in `ACTIVE` state.
 
 ### 2. Create a Reservation
 Request services (e.g. electricity, water, gas):
-```bash
-curl -X POST http://localhost:8000/reservations \
-  -H "Content-Type: application/json" \
-  -d '{
-    "customer_name": "Ahmed Ben Ali",
-    "card_uid": "RFID-A1B2C3D4",
-    "requested_services": ["electricity", "water", "gas"]
-  }'
+```powershell
+$body = @{
+    customer_name = "Ahmed Ben Ali"
+    card_uid = "RFID-A1B2C3D4"
+    requested_services = @("electricity", "water", "gas")
+} | ConvertTo-Json
+
+$reservation = Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8000/reservations" `
+    -ContentType "application/json" `
+    -Body $body
+
+$reservation | Format-List *
 ```
 Response (201 Created):
 ```json
@@ -109,45 +117,73 @@ Response (201 Created):
   "expires_at": "..."
 }
 ```
-*The backend auto-assigns `ST-01`, sets its state to `OCCUPIED`, and sends `ASSIGN_RESERVATION` via MQTT. Terminal `ST-01` enters `WAITING_FOR_CARD`.*
+Save the returned `assigned_terminal_id` and `session_id`. The backend
+automatically selects the first available terminal, sets its database status
+to `OCCUPIED`, and sends `ASSIGN_RESERVATION` via MQTT.
+
+Check the simulator state before tapping the card:
+```powershell
+Invoke-RestMethod http://localhost:8001/terminals
+```
+The assigned terminal must be `WAITING_FOR_CARD`.
 
 ### 3. First RFID Card Tap (Start Consumption)
-Tap the matching card UID on `ST-01`:
-```bash
-curl -X POST http://localhost:8001/terminals/ST-01/card \
-  -H "Content-Type: application/json" \
-  -d '{"cardUid": "RFID-A1B2C3D4"}'
+Tap the matching card UID on the terminal returned in
+`assigned_terminal_id`:
+```powershell
+$card = @{
+    cardUid = "RFID-A1B2C3D4"
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8001/terminals/$($reservation.assigned_terminal_id)/card" `
+    -ContentType "application/json" `
+    -Body $card
 ```
-*`ST-01` transitions to `RUNNING` and starts generating cumulative consumption on electricity, water, and gas every 3 seconds.*
+The terminal transitions to `RUNNING` and starts generating cumulative
+consumption on electricity, water, and gas every 3 seconds.
 
 *(Optional) Try tapping a wrong card UID `RFID-WRONG`: it will be rejected with HTTP 400 and will not start consumption.*
 
 ### 4. Poll Live Consumption
-Poll telemetry for the active session:
-```bash
-curl -X GET http://localhost:8000/sessions/{sessionId}/consumption
+Wait for readings to accumulate, then use the `session_id` returned by the
+reservation:
+```powershell
+Start-Sleep -Seconds 10
+
+Invoke-RestMethod `
+    -Uri "http://localhost:8000/sessions/$($reservation.session_id)/consumption"
 ```
 
 ### 5. Second RFID Card Tap (Stop Session)
-Tap the card again to stop the session:
-```bash
-curl -X POST http://localhost:8001/terminals/ST-01/card \
-  -H "Content-Type: application/json" \
-  -d '{"cardUid": "RFID-A1B2C3D4"}'
+Tap the same card again to stop the session:
+```powershell
+Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8001/terminals/$($reservation.assigned_terminal_id)/card" `
+    -ContentType "application/json" `
+    -Body $card
 ```
-*`ST-01` stops meter generation, records final readings, transitions to `STOPPING`, and publishes `FINAL_READINGS` (QoS 1).*
+The terminal stops meter generation, records final readings, transitions to
+`STOPPING`, and publishes `FINAL_READINGS` (QoS 1).
 
 ### 6. Automated Backend Billing
 The backend receives `FINAL_READINGS`:
 - Persists final readings with `is_final = True`.
 - Computes billing across tiered brackets.
 - Stores invoice with `UNIQUE(session_id)` constraint.
-- Sends `COMPLETE_SESSION` command to `ST-01`.
+- Sends `COMPLETE_SESSION` command to the assigned terminal.
 - Terminal resets its meters and returns to `ACTIVE`.
 
 ### 7. Retrieve Invoice & Billing Breakdown
-```bash
-curl -X GET http://localhost:8000/sessions/{sessionId}/invoice
+Wait a few seconds for the backend to process the final readings, then query
+the invoice:
+```powershell
+Start-Sleep -Seconds 5
+
+Invoke-RestMethod `
+    -Uri "http://localhost:8000/sessions/$($reservation.session_id)/invoice"
 ```
 Example Output:
 ```json
